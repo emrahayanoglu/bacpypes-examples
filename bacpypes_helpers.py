@@ -26,33 +26,41 @@ def setup_logger() -> logging.Logger:
     return logger
 
 
-# Define the BACnet client application
-class BACnetClient(BIPSimpleApplication):
-    def __init__(self, local_device, local_address):
-        self._logger = setup_logger()
-        super(BACnetClient, self).__init__(local_device, local_address)
+class IocbHelper(object):
+    def __init__(self, iocb: IOCB, request_io: Callable[[IOCB], Any]):
+        self._iocb = iocb
+        self._request_io = request_io
 
-    def _init_iocb(self, iocb: IOCB, successful_callback: Callable[[APDU], Any]) -> Any:
-        # give it to the application
-        deferred(self.request_io, iocb)
+    def __enter__(self):
+        deferred(self._request_io, self._iocb)
+        self._iocb.wait()
 
-        # wait for it to complete
-        iocb.wait()
-
-        return_value = None
-
-        if iocb.ioError:
-            # do something for success
-            self._logger.error(str(iocb.ioError))
-        elif iocb.ioResponse:
-            return_value = successful_callback(iocb.ioResponse)
-        else:
-            self._logger.error("something wrong")
-
-        # stop the thread
+    def __exit__(self, exc_type, exc_val, exc_tb):
         deferred(stop)
 
-        return return_value
+
+# Define the BACnet client application
+class BACnetClient(BIPSimpleApplication):
+    def __init__(self, local_address):
+        self._logger = setup_logger()
+        super(BACnetClient, self).__init__(LocalDeviceObject(
+            objectName="BACpypes Client",
+            objectIdentifier=("device", 1),
+            maxApduLengthAccepted=1024,
+            segmentationSupported="segmentedBoth",
+            vendorIdentifier=15,
+        ), local_address)
+
+    def _init_iocb(self, iocb: IOCB, successful_callback: Callable[[APDU], Any]) -> Any:
+        with IocbHelper(iocb, self.request_io):
+            if iocb.ioError:
+                # do something for success
+                self._logger.error(str(iocb.ioError))
+            elif iocb.ioResponse:
+                return successful_callback(iocb.ioResponse)
+            else:
+                self._logger.error("something wrong")
+            return None
 
     def _do_read_property(self, read_property_request: ReadPropertyRequest, property_identifier: str):
         def callback(apdu: APDU) -> Any:
@@ -104,15 +112,7 @@ def get_property_value(local_address: str, device_address: str, object_type: str
     # Define the BACnet device information
     device_address = Address(device_address)
     local_address = Address("{}/24:47909".format(local_address))
-    local_device = LocalDeviceObject(
-        objectName="BACpypes Client",
-        objectIdentifier=("device", 1),
-        maxApduLengthAccepted=1024,
-        segmentationSupported="segmentedBoth",
-        vendorIdentifier=15,
-    )
-
     object_identifier = (object_type, object_identifier)
 
-    client = BACnetClient(local_device, local_address)
+    client = BACnetClient(local_address)
     return client.make_request_read_property(device_address, object_identifier, property_identifier)
