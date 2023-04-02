@@ -1,6 +1,8 @@
 import sys
+import threading
 
-from bacpypes.apdu import ReadPropertyRequest, APDU, ReadPropertyMultipleRequest
+from bacpypes.apdu import ReadPropertyRequest, APDU, ReadPropertyMultipleRequest, SubscribeCOVRequest, SimpleAckPDU
+from bacpypes.errors import ExecutionError
 from bacpypes.object import get_datatype
 from bacpypes.iocb import IOCB
 
@@ -12,18 +14,25 @@ from bacpypes.local.device import LocalDeviceObject
 import concurrent.futures
 from typing import Callable, Tuple, Any
 import logging
+import time
 
 FORMATTER = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
+LOGGER = None
+
 
 def setup_logger() -> logging.Logger:
+    global LOGGER
+    if LOGGER:
+        return LOGGER
+
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(FORMATTER)
 
-    logger = logging.getLogger("BACnetClient")
-    logger.setLevel(logging.DEBUG)
-    logger.addHandler(console_handler)
-    return logger
+    LOGGER = logging.getLogger("BACnetClient")
+    LOGGER.setLevel(logging.DEBUG)
+    LOGGER.addHandler(console_handler)
+    return LOGGER
 
 
 class IocbHelper(object):
@@ -41,7 +50,7 @@ class IocbHelper(object):
 
 # Define the BACnet client application
 class BACnetClient(BIPSimpleApplication):
-    def __init__(self, local_address):
+    def __init__(self, local_address: Address):
         self._logger = setup_logger()
         super(BACnetClient, self).__init__(LocalDeviceObject(
             objectName="BACpypes Client",
@@ -107,12 +116,174 @@ class BACnetClient(BIPSimpleApplication):
             return future.result()
 
 
+class SubscriptionContext:
+    def __init__(self, address: Address, objid, subscription_context: dict, property_identifier: str,
+                 confirmed: bool = False, lifetime: int = 20, proc_id: int = 1000):
+        # destination for subscription requests
+        self.address = address
+
+        # assign a unique process identifer and keep track of it
+        self._subscription_context = subscription_context
+        self._property_identifier = property_identifier
+        self.subscriberProcessIdentifier = proc_id
+        self._subscription_context[self.subscriberProcessIdentifier] = self
+
+        self.monitoredObjectIdentifier = objid
+        self.issueConfirmedNotifications = confirmed
+        self.lifetime = lifetime
+        self._logger = setup_logger()
+        self._value_list = []
+
+    def cov_notification(self, apdu):
+        self._logger.debug("{} {} changed\n    {}".format(
+            apdu.pduSource,
+            apdu.monitoredObjectIdentifier,
+            ",\n    ".join("{} = {}".format(
+                element.propertyIdentifier,
+                str(element.value.tagList[0].app_to_object().value),
+            ) for element in apdu.listOfValues),
+        ))
+        for element in apdu.listOfValues:
+            if element.propertyIdentifier != self._property_identifier:
+                continue
+            self._value_list.append(str(element.value.tagList[0].app_to_object().value))
+
+    @property
+    def values(self):
+        return self._value_list
+
+
+class SubscribeCOVApplication(BIPSimpleApplication):
+    def __init__(self, subscription_context: dict, local_address: Address):
+        self._logger = setup_logger()
+        self._subscription_context = subscription_context
+        super(SubscribeCOVApplication, self).__init__(LocalDeviceObject(
+            objectName="BACpypes Client",
+            objectIdentifier=("device", 1),
+            maxApduLengthAccepted=1024,
+            segmentationSupported="segmentedBoth",
+            vendorIdentifier=15,
+        ), local_address)
+
+    def send_subscription(self, context):
+        # build a request
+        request = SubscribeCOVRequest(
+            subscriberProcessIdentifier=context.subscriberProcessIdentifier,
+            monitoredObjectIdentifier=context.monitoredObjectIdentifier,
+        )
+        request.pduDestination = context.address
+
+        # optional parameters
+        if context.issueConfirmedNotifications is not None:
+            request.issueConfirmedNotifications = context.issueConfirmedNotifications
+        if context.lifetime is not None:
+            request.lifetime = context.lifetime
+
+        # make an IOCB
+        iocb = IOCB(request)
+        self._logger.debug("    - iocb: %r", iocb)
+
+        # callback when it is acknowledged
+        iocb.add_callback(self.subscription_acknowledged)
+
+        # give it to the application
+        self.request_io(iocb)
+
+    def subscription_acknowledged(self, iocb):
+        self._logger.debug("Subscription Acknowledged!")
+
+        # do something for success
+        if iocb.ioResponse:
+            self._logger.debug("    - response: %r", iocb.ioResponse)
+
+        # do something for error/reject/abort
+        if iocb.ioError:
+            self._logger.debug("    - error: %r", iocb.ioError)
+
+    def do_ConfirmedCOVNotificationRequest(self, apdu):
+        self._logger.debug("do_ConfirmedCOVNotificationRequest %r", apdu)
+
+        # look up the process identifier
+        context = self._subscription_context.get(apdu.subscriberProcessIdentifier, None)
+        if not context or apdu.pduSource != context.address:
+            self._logger.debug("    - no context")
+
+            # this is turned into an ErrorPDU and sent back to the client
+            raise ExecutionError('services', 'unknownSubscription')
+
+        # now tell the context object
+        context.cov_notification(apdu)
+
+        # success
+        response = SimpleAckPDU(context=apdu)
+        self._logger.debug("    - simple_ack: %r", response)
+
+        # return the result
+        self.response(response)
+
+    def do_UnconfirmedCOVNotificationRequest(self, apdu):
+        self._logger.debug("do_UnconfirmedCOVNotificationRequest %r", apdu)
+
+        # look up the process identifier
+        context = self._subscription_context.get(apdu.subscriberProcessIdentifier, None)
+        if not context or apdu.pduSource != context.address:
+            self._logger.debug("    - no context")
+            return
+
+        # now tell the context object
+        context.cov_notification(apdu)
+
+
+def run_bacpypes_for_x_seconds(x: int):
+    logger = setup_logger()
+    start_time = time.time()
+
+    def stop_after_x_seconds():
+        logger.debug("Starting the timeout thread")
+        while True:
+            if time.time() - start_time > (x + 1):
+                logger.debug("Stopping the Thread")
+                deferred(stop)
+                return
+            time.sleep(1)
+
+    thread = threading.Thread(target=stop_after_x_seconds)
+    thread.start()
+    logger.info("Started up Bacpypes")
+    run()
+    thread.join()
+    logger.info("Stopped up Bacpypes")
+
+
 def get_property_value(local_address: str, device_address: str, object_type: str, object_identifier: int,
                        property_identifier: str) -> Any:
     # Define the BACnet device information
     device_address = Address(device_address)
-    local_address = Address("{}/24:47909".format(local_address))
+    local_address = Address("{}/24:47910".format(local_address))
     object_identifier = (object_type, object_identifier)
 
     client = BACnetClient(local_address)
     return client.make_request_read_property(device_address, object_identifier, property_identifier)
+
+
+def do_cov_subscription(local_address: str, device_address: str, object_type: str, object_identifier: int,
+                        property_identifier: str, confirmed: bool = False, duration: int = 20) -> list[str]:
+    logger = setup_logger()
+    # Define the BACnet device information
+    subscription_context = {}
+    device_address = Address(device_address)
+    local_address = Address("{}/24:47911".format(local_address))
+    object_identifier = (object_type, object_identifier)
+
+    # initialize SubscribeCOVApplication
+    client = SubscribeCOVApplication(subscription_context, local_address)
+    # initialize a subscription context
+    context = SubscriptionContext(device_address, object_identifier, subscription_context, property_identifier,
+                                  confirmed, duration)
+
+    logger.info("Running CoV Subscription")
+    deferred(client.send_subscription, context)
+    run_bacpypes_for_x_seconds(duration)
+    logger.info("Finished CoV Subscription")
+
+    return context.values
